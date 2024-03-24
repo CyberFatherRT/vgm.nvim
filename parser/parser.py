@@ -1,5 +1,6 @@
+import aiohttp
+import asyncio
 import json
-import requests
 import urllib.parse as parse
 
 from typing import List
@@ -39,24 +40,28 @@ class Album:
             "album_type": self.album_type,
             "year": self.year,
             "platforms": self.platforms,
-            "tracks": [track.__dict__ for track in self.tracks],
+            "tracks": list(map(lambda x: x.__dict__, self.tracks)),
         }
 
         return json.dumps(d, indent=4)
 
 
 class Parser:
-    def __init__(self, request: str | None = None):
+    def __init__(self):
         self.url = "https://downloads.khinsider.com"
         self.albums: List[Album] = []
-        self.query(request)
 
-    def query(self, request: str | None):
+    async def fetch_content(self, url):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                return await response.text()
+
+    async def query(self, request: str):
         if request is None:
             return
 
         request = parse.quote(request, safe="")
-        content = requests.get(self.url + f"/search?search={request}").text
+        content = await self.fetch_content(self.url + f"/search?search={request}")
 
         soup = BeautifulSoup(content, features="lxml")
         table = soup.find("table", {"class": "albumList"})
@@ -64,13 +69,28 @@ class Parser:
         if table is None:
             return
 
+        tasks = []
         for row in table.find_all("tr")[1:]:
             td = row.find_all("td")
-            self.__parse(td)
-            self.__parse_albums(self.albums[-1])
+            album_link, _ = self.__parse_link(td[0])
+            album = Album(
+                album_link=f"{self.url}{album_link}",
+                album_img=None,
+                album_name=str(td[1].find("a").contents[0]),
+                product_name=str(td[1].find("span").contents[0])
+                if td[1].find("span")
+                else None,
+                platforms=[str(a.contents[0]) for a in td[2].find_all("a")],
+                album_type=str(td[3].contents[0]) if td[3].contents else None,
+                year=int(td[4].contents[0]) if td[4].contents else None,
+                tracks=[],
+            )
+            tasks.append(self.__parse_album(album))
 
-    def __parse_albums(self, album: Album):
-        content = requests.get(album.album_link).text
+        await asyncio.gather(*tasks)
+
+    async def __parse_album(self, album: Album):
+        content = await self.fetch_content(album.album_link)
 
         soup = BeautifulSoup(content, features="lxml")
         songs_table = soup.find("table", id="songlist")
@@ -85,12 +105,11 @@ class Parser:
             time = time.find("a").contents[0]
             mp3_size = mp3_size.find("a").contents[0]
             flac_size = flac_size.find("a").contents[0]
-            mp3_link, flac_link = self.__parse_download_links(
+            mp3_link, flac_link = await self.__parse_download_links(
                 self.url + download_link.find("a").get("href")
             )
-            # mp3_link, flac_link = "", ""
 
-            self.albums[-1].tracks.append(
+            album.tracks.append(
                 Track(
                     number=int(number),
                     name=str(name),
@@ -102,32 +121,15 @@ class Parser:
                 )
             )
 
-    def __parse_download_links(self, download_link: str):
-        content = requests.get(download_link).text
+        self.albums.append(album)
+
+    async def __parse_download_links(self, download_link: str):
+        content = await self.fetch_content(download_link)
         soup = BeautifulSoup(content, features="lxml")
         links = soup.select("a[href$='.mp3'], a[href$='.flac']")
         mp3 = links[0].get("href")
         flac = links[1].get("href")
         return mp3, flac
-
-    def __parse(self, data: List[Tag]):
-        album_link, album_img = self.__parse_link(data[0])
-        album_name, product_name = self.__parse_name(data[1])
-        platforms = self.__parse_platforms(data[2])
-        album_type = self.__parse_album_type(data[3])
-        year = self.__parse_year(data[4])
-        self.albums.append(
-            Album(
-                album_link=f"{self.url}{album_link}",
-                album_img=str(album_img),
-                album_name=str(album_name),
-                product_name=str(product_name),
-                platforms=platforms,
-                album_type=album_type,
-                year=year,
-                tracks=[],
-            )
-        )
 
     def __parse_link(self, link: Tag):
         a = link.find("a")
@@ -136,32 +138,7 @@ class Parser:
             return None, None
 
         img = a.find("img")
-
         if img is None:
             return a.get("href"), None
 
         return a.get("href"), img.get("src")
-
-    def __parse_name(self, name: Tag) -> tuple[str, str]:
-        album_name = name.find("a").contents[0]
-        product_name = name.find("span")
-
-        if product_name is not None:
-            product_name = product_name.contents[0]
-
-        return str(album_name), str(product_name)
-
-    def __parse_platforms(self, platforms: Tag) -> List[str]:
-        return list(map(lambda x: x.contents[0], platforms.find_all("a")))
-
-    def __parse_album_type(self, album_type: Tag) -> str | None:
-        contents = album_type.contents
-        if contents:
-            return str(contents[0])
-        return None
-
-    def __parse_year(self, year: Tag) -> int | None:
-        contents = year.contents
-        if contents:
-            return int(f"{contents[0]}")
-        return None
